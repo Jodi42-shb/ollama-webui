@@ -8,6 +8,7 @@ import ollama
 import json
 import uuid
 import os
+import base64
 from datetime import datetime
 from pathlib import Path
 
@@ -159,6 +160,9 @@ if "edit_idx" not in st.session_state:
     st.session_state.edit_idx = None
 if "pull_progress" not in st.session_state:
     st.session_state.pull_progress = ""
+if "pending_attachments" not in st.session_state:
+    # list of {"name": str, "mime": str, "b64": str}
+    st.session_state.pending_attachments = []
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sidebar
@@ -401,6 +405,11 @@ for i, msg in enumerate(chat["messages"]):
                     st.session_state.edit_idx = None
                     st.rerun()
         else:
+            # Render any attached images stored with the message
+            for att in msg.get("attachments", []):
+                if att["mime"].startswith("image/"):
+                    img_bytes = base64.b64decode(att["b64"])
+                    st.image(img_bytes, caption=att["name"], use_container_width=False, width=420)
             st.markdown(msg["content"])
             # Action buttons (subtle)
             ac1, ac2, ac3, *_ = st.columns([1, 1, 1, 10])
@@ -418,13 +427,63 @@ for i, msg in enumerate(chat["messages"]):
                     st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Attachment uploader
+# ─────────────────────────────────────────────────────────────────────────────
+SUPPORTED_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"]
+
+with st.container():
+    uploaded_files = st.file_uploader(
+        "📎 Attach images (optional)",
+        type=["png", "jpg", "jpeg", "webp", "gif"],
+        accept_multiple_files=True,
+        label_visibility="collapsed",
+        key="file_uploader",
+    )
+
+    # Sync uploader into pending_attachments
+    if uploaded_files:
+        existing_names = {a["name"] for a in st.session_state.pending_attachments}
+        for f in uploaded_files:
+            if f.name not in existing_names:
+                raw = f.read()
+                st.session_state.pending_attachments.append({
+                    "name": f.name,
+                    "mime": f.type,
+                    "b64": base64.b64encode(raw).decode(),
+                })
+
+    # Preview pending attachments
+    if st.session_state.pending_attachments:
+        cols = st.columns(min(len(st.session_state.pending_attachments), 6))
+        for idx, att in enumerate(st.session_state.pending_attachments):
+            with cols[idx % 6]:
+                if att["mime"].startswith("image/"):
+                    img_bytes = base64.b64decode(att["b64"])
+                    st.image(img_bytes, caption=att["name"], width=100)
+                else:
+                    st.caption(f"📄 {att['name']}")
+                if st.button("✕", key=f"rm_att_{idx}", help="Remove"):
+                    st.session_state.pending_attachments.pop(idx)
+                    st.rerun()
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Chat input & streaming
 # ─────────────────────────────────────────────────────────────────────────────
-user_input = st.chat_input("Message…", disabled=st.session_state.generating)
+has_attachments = bool(st.session_state.pending_attachments)
+placeholder_text = "Message… (image(s) attached 📎)" if has_attachments else "Message…"
+user_input = st.chat_input(placeholder_text, disabled=st.session_state.generating)
 
 if user_input and not st.session_state.generating:
-    # Append user message
-    chat["messages"].append({"role": "user", "content": user_input.strip()})
+    attachments = list(st.session_state.pending_attachments)  # snapshot
+    st.session_state.pending_attachments = []                  # clear queue
+
+    # Build stored message (includes attachments for history rendering)
+    user_msg = {
+        "role": "user",
+        "content": user_input.strip(),
+        "attachments": attachments,
+    }
+    chat["messages"].append(user_msg)
 
     # Auto-title on first message
     if chat["title"] == "New Chat" and len(chat["messages"]) == 1:
@@ -434,18 +493,28 @@ if user_input and not st.session_state.generating:
     save_chat(chat)
 
     # Build API message list
+    # For multimodal messages, pass images as bytes to Ollama
     api_messages = []
     if chat.get("system_prompt", "").strip():
         api_messages.append({"role": "system", "content": chat["system_prompt"]})
-    api_messages.extend({"role": m["role"], "content": m["content"]} for m in chat["messages"])
+
+    for m in chat["messages"]:
+        api_msg = {"role": m["role"], "content": m["content"]}
+        img_atts = [a for a in m.get("attachments", []) if a["mime"].startswith("image/")]
+        if img_atts:
+            api_msg["images"] = [base64.b64decode(a["b64"]) for a in img_atts]
+        api_messages.append(api_msg)
 
     # Display user bubble immediately
     with st.chat_message("user"):
+        for att in attachments:
+            if att["mime"].startswith("image/"):
+                st.image(base64.b64decode(att["b64"]), caption=att["name"], width=420)
         st.markdown(user_input)
 
     # Stream assistant response
     with st.chat_message("assistant"):
-        placeholder = st.empty()
+        resp_placeholder = st.empty()
         full_response = ""
         st.session_state.generating = True
 
@@ -465,12 +534,12 @@ if user_input and not st.session_state.generating:
             for chunk in stream:
                 token = chunk.get("message", {}).get("content", "")
                 full_response += token
-                placeholder.markdown(full_response + "▌")
-            placeholder.markdown(full_response)
+                resp_placeholder.markdown(full_response + "▌")
+            resp_placeholder.markdown(full_response)
 
         except Exception as e:
             error_msg = f"⚠️ **Error:** `{e}`"
-            placeholder.error(error_msg)
+            resp_placeholder.error(error_msg)
             full_response = error_msg
 
     st.session_state.generating = False
