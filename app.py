@@ -164,18 +164,31 @@ def extract_text_from_attachment(att: dict) -> str:
         text = None
         errors = []
 
-        # Try pdfplumber first (best quality, handles tables/layout)
+        # 1. pymupdf — most robust, handles widest range of PDF encodings
         try:
-            import pdfplumber
-            with pdfplumber.open(io.BytesIO(raw)) as pdf:
-                pages = [p.extract_text() or "" for p in pdf.pages]
+            import fitz  # pymupdf
+            doc = fitz.open(stream=raw, filetype="pdf")
+            pages = [page.get_text() for page in doc]
+            doc.close()
             text = "\n\n".join(p for p in pages if p.strip())
         except ImportError:
-            errors.append("pdfplumber not installed")
+            errors.append("pymupdf not installed")
         except Exception as e:
-            errors.append(f"pdfplumber: {e}")
+            errors.append(f"pymupdf: {e}")
 
-        # Fallback to pypdf
+        # 2. pdfplumber — good for tables / complex layouts
+        if not text:
+            try:
+                import pdfplumber
+                with pdfplumber.open(io.BytesIO(raw)) as pdf:
+                    pages = [p.extract_text() or "" for p in pdf.pages]
+                text = "\n\n".join(p for p in pages if p.strip())
+            except ImportError:
+                errors.append("pdfplumber not installed")
+            except Exception as e:
+                errors.append(f"pdfplumber: {e}")
+
+        # 3. pypdf — lightweight fallback
         if not text:
             try:
                 import pypdf
@@ -195,12 +208,13 @@ def extract_text_from_attachment(att: dict) -> str:
                 f"{text.strip()}"
             )
         else:
-            err_detail = "; ".join(errors) if errors else "no text extracted (may be scanned/image PDF)"
+            err_detail = "; ".join(errors) if errors else "unknown"
             return (
                 f"[PDF attached: {name}]\n"
                 f"PDF text extraction FAILED ({err_detail}). "
+                f"This is likely a scanned/image-based PDF with no text layer. "
                 f"Do NOT guess content from the filename. "
-                f"Tell the user the PDF could not be read and ask them to paste the text manually."
+                f"Tell the user the PDF could not be read and suggest they copy-paste the text."
             )
 
     if ext in TEXT_EXTS:
@@ -365,6 +379,10 @@ with st.sidebar:
                         st.rerun()
                     except Exception as e:
                         st.error(f"Pull failed: {e}")
+
+    # ── Debug ──
+    with st.expander("🛠  Debug", expanded=False):
+        st.session_state.show_debug = st.toggle("Show API payload", value=st.session_state.get("show_debug", False))
 
     # ── Model Info ──
     with st.expander("ℹ️  Model Info", expanded=False):
@@ -588,17 +606,18 @@ if user_input and not st.session_state.generating:
 
     for m in chat["messages"]:
         content_parts = [m["content"]]
-        img_bytes_list = []
+        img_b64_list = []
         for att in m.get("attachments", []):
             kind = att.get("kind", "image" if att["mime"].startswith("image/") else "text")
             if kind == "image":
-                img_bytes_list.append(base64.b64decode(att["b64"]))
+                # Pass base64 string directly — ollama lib handles encoding internally
+                img_b64_list.append(att["b64"])
             else:
                 # PDF and text files: inject extracted text as context
                 content_parts.insert(0, extract_text_from_attachment(att))
         api_msg = {"role": m["role"], "content": "\n\n".join(content_parts)}
-        if img_bytes_list:
-            api_msg["images"] = img_bytes_list
+        if img_b64_list:
+            api_msg["images"] = img_b64_list
         api_messages.append(api_msg)
 
     # Display user bubble immediately
@@ -612,6 +631,17 @@ if user_input and not st.session_state.generating:
             else:
                 st.caption(f"📄 {att['name']}")
         st.markdown(user_input)
+
+    # Debug: show what's being sent (toggle in sidebar via session state)
+    if st.session_state.get("show_debug"):
+        with st.expander("🛠 API payload (debug)", expanded=False):
+            debug_view = []
+            for m in api_messages:
+                entry = {"role": m["role"], "content": m["content"][:200] + "..." if len(m["content"]) > 200 else m["content"]}
+                if "images" in m:
+                    entry["images"] = f"[{len(m['images'])} image(s), b64 len={[len(i) for i in m['images']]}]"
+                debug_view.append(entry)
+            st.json(debug_view)
 
     # Stream assistant response
     with st.chat_message("assistant"):
