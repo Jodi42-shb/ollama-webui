@@ -144,6 +144,78 @@ def export_markdown(chat: dict) -> str:
         lines += [f"{role}:", msg["content"], ""]
     return "\n".join(lines)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Attachment helpers
+# ─────────────────────────────────────────────────────────────────────────────
+IMAGE_EXTS = {"png", "jpg", "jpeg", "webp", "gif"}
+TEXT_EXTS  = {"txt", "md", "py", "js", "ts", "c", "cpp", "h", "java",
+              "sh", "zsh", "bash", "json", "yaml", "yml", "toml", "csv",
+              "html", "css", "xml", "rst", "log"}
+
+def extract_text_from_attachment(att: dict) -> str:
+    """Return plain text to inject into message context for non-image files."""
+    raw = base64.b64decode(att["b64"])
+    ext = att["name"].rsplit(".", 1)[-1].lower()
+    name = att["name"]
+
+    if ext == "pdf":
+        import io
+        text = None
+        errors = []
+
+        # Try pdfplumber first (best quality, handles tables/layout)
+        try:
+            import pdfplumber
+            with pdfplumber.open(io.BytesIO(raw)) as pdf:
+                pages = [p.extract_text() or "" for p in pdf.pages]
+            text = "\n\n".join(p for p in pages if p.strip())
+        except ImportError:
+            errors.append("pdfplumber not installed")
+        except Exception as e:
+            errors.append(f"pdfplumber: {e}")
+
+        # Fallback to pypdf
+        if not text:
+            try:
+                import pypdf
+                reader = pypdf.PdfReader(io.BytesIO(raw))
+                pages = [p.extract_text() or "" for p in reader.pages]
+                text = "\n\n".join(p for p in pages if p.strip())
+            except ImportError:
+                errors.append("pypdf not installed")
+            except Exception as e:
+                errors.append(f"pypdf: {e}")
+
+        if text and text.strip():
+            return (
+                f"[PDF attached: {name}]\n"
+                f"The following is the full extracted text from this PDF. "
+                f"Answer the user based on this content.\n\n"
+                f"{text.strip()}"
+            )
+        else:
+            err_detail = "; ".join(errors) if errors else "no text extracted (may be scanned/image PDF)"
+            return (
+                f"[PDF attached: {name}]\n"
+                f"PDF text extraction FAILED ({err_detail}). "
+                f"Do NOT guess content from the filename. "
+                f"Tell the user the PDF could not be read and ask them to paste the text manually."
+            )
+
+    if ext in TEXT_EXTS:
+        try:
+            return (
+                f"[File attached: {name}]\n"
+                f"Full file content below:\n\n"
+                f"{raw.decode('utf-8', errors='replace')}"
+            )
+        except Exception as e:
+            return f"[File: {name}]\n(read error: {e})"
+
+    return f"[Attachment: {name}] (unsupported type for text extraction)"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Session state bootstrap
 # ─────────────────────────────────────────────────────────────────────────────
@@ -405,11 +477,22 @@ for i, msg in enumerate(chat["messages"]):
                     st.session_state.edit_idx = None
                     st.rerun()
         else:
-            # Render any attached images stored with the message
+            # Render attachments stored with the message
             for att in msg.get("attachments", []):
-                if att["mime"].startswith("image/"):
+                kind = att.get("kind", "image" if att["mime"].startswith("image/") else "text")
+                if kind == "image":
                     img_bytes = base64.b64decode(att["b64"])
                     st.image(img_bytes, caption=att["name"], use_container_width=False, width=420)
+                elif kind == "pdf":
+                    with st.expander(f"📕 {att['name']}"):
+                        extracted = extract_text_from_attachment(att)
+                        prefix = f"[PDF: {att['name']}]\n"
+                        st.text(extracted[len(prefix):] if extracted.startswith(prefix) else extracted)
+                else:
+                    with st.expander(f"📄 {att['name']}"):
+                        extracted = extract_text_from_attachment(att)
+                        prefix = f"[File: {att['name']}]\n"
+                        st.code(extracted[len(prefix):] if extracted.startswith(prefix) else extracted)
             st.markdown(msg["content"])
             # Action buttons (subtle)
             ac1, ac2, ac3, *_ = st.columns([1, 1, 1, 10])
@@ -429,12 +512,12 @@ for i, msg in enumerate(chat["messages"]):
 # ─────────────────────────────────────────────────────────────────────────────
 # Attachment uploader
 # ─────────────────────────────────────────────────────────────────────────────
-SUPPORTED_TYPES = ["image/png", "image/jpeg", "image/webp", "image/gif"]
+ACCEPT_TYPES = list(IMAGE_EXTS) + ["pdf"] + list(TEXT_EXTS)
 
 with st.container():
     uploaded_files = st.file_uploader(
-        "📎 Attach images (optional)",
-        type=["png", "jpg", "jpeg", "webp", "gif"],
+        "📎 Attach files",
+        type=ACCEPT_TYPES,
         accept_multiple_files=True,
         label_visibility="collapsed",
         key="file_uploader",
@@ -446,10 +529,13 @@ with st.container():
         for f in uploaded_files:
             if f.name not in existing_names:
                 raw = f.read()
+                ext = f.name.rsplit(".", 1)[-1].lower()
+                kind = "image" if ext in IMAGE_EXTS else ("pdf" if ext == "pdf" else "text")
                 st.session_state.pending_attachments.append({
                     "name": f.name,
-                    "mime": f.type,
-                    "b64": base64.b64encode(raw).decode(),
+                    "mime": f.type or f"application/{ext}",
+                    "kind": kind,          # "image" | "pdf" | "text"
+                    "b64":  base64.b64encode(raw).decode(),
                 })
 
     # Preview pending attachments
@@ -457,11 +543,12 @@ with st.container():
         cols = st.columns(min(len(st.session_state.pending_attachments), 6))
         for idx, att in enumerate(st.session_state.pending_attachments):
             with cols[idx % 6]:
-                if att["mime"].startswith("image/"):
-                    img_bytes = base64.b64decode(att["b64"])
-                    st.image(img_bytes, caption=att["name"], width=100)
+                if att["kind"] == "image":
+                    st.image(base64.b64decode(att["b64"]), caption=att["name"], width=100)
+                elif att["kind"] == "pdf":
+                    st.markdown(f"📕 `{att['name']}`")
                 else:
-                    st.caption(f"📄 {att['name']}")
+                    st.markdown(f"📄 `{att['name']}`")
                 if st.button("✕", key=f"rm_att_{idx}", help="Remove"):
                     st.session_state.pending_attachments.pop(idx)
                     st.rerun()
@@ -470,7 +557,8 @@ with st.container():
 # Chat input & streaming
 # ─────────────────────────────────────────────────────────────────────────────
 has_attachments = bool(st.session_state.pending_attachments)
-placeholder_text = "Message… (image(s) attached 📎)" if has_attachments else "Message…"
+n_att = len(st.session_state.pending_attachments)
+placeholder_text = f"Message… ({n_att} file(s) attached 📎)" if has_attachments else "Message…"
 user_input = st.chat_input(placeholder_text, disabled=st.session_state.generating)
 
 if user_input and not st.session_state.generating:
@@ -499,17 +587,30 @@ if user_input and not st.session_state.generating:
         api_messages.append({"role": "system", "content": chat["system_prompt"]})
 
     for m in chat["messages"]:
-        api_msg = {"role": m["role"], "content": m["content"]}
-        img_atts = [a for a in m.get("attachments", []) if a["mime"].startswith("image/")]
-        if img_atts:
-            api_msg["images"] = [base64.b64decode(a["b64"]) for a in img_atts]
+        content_parts = [m["content"]]
+        img_bytes_list = []
+        for att in m.get("attachments", []):
+            kind = att.get("kind", "image" if att["mime"].startswith("image/") else "text")
+            if kind == "image":
+                img_bytes_list.append(base64.b64decode(att["b64"]))
+            else:
+                # PDF and text files: inject extracted text as context
+                content_parts.insert(0, extract_text_from_attachment(att))
+        api_msg = {"role": m["role"], "content": "\n\n".join(content_parts)}
+        if img_bytes_list:
+            api_msg["images"] = img_bytes_list
         api_messages.append(api_msg)
 
     # Display user bubble immediately
     with st.chat_message("user"):
         for att in attachments:
-            if att["mime"].startswith("image/"):
+            kind = att.get("kind", "image" if att["mime"].startswith("image/") else "text")
+            if kind == "image":
                 st.image(base64.b64decode(att["b64"]), caption=att["name"], width=420)
+            elif kind == "pdf":
+                st.caption(f"📕 {att['name']}")
+            else:
+                st.caption(f"📄 {att['name']}")
         st.markdown(user_input)
 
     # Stream assistant response
