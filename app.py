@@ -31,7 +31,7 @@ st.set_page_config(
 st.markdown("""
 <style>
 /* ---- General ---- */
-[data-testid="stSidebar"] { background: #0d0d0d; }
+[data-testid="stSidebar"] { background: #bfbfbf; }
 [data-testid="stSidebar"] .stButton > button { text-align: left; }
 .stChatMessage [data-testid="stMarkdownContainer"] pre {
     background: #1a1a2e;
@@ -660,6 +660,7 @@ if user_input and not st.session_state.generating:
                     "top_k":          chat["params"]["top_k"],
                     "num_ctx":        chat["params"]["num_ctx"],
                     "repeat_penalty": chat["params"].get("repeat_penalty", 1.1),
+                    # "num_gpu":        79,
                 },
             )
             for chunk in stream:
